@@ -1,15 +1,17 @@
 import streamlit as st
 import os
-from document_processor import process_uploaded_files, summarize_content
+from document_processor import process_uploaded_files
 from vector import VectorDB
 from interface import QAChain
 import tempfile
 import sys
 import shutil
 import io
-import pandas as pd
 from fpdf import FPDF
 from pathlib import Path
+import base64
+from gtts import gTTS
+import pygame
 
 # Fix for PyTorch + Streamlit watcher bug
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
@@ -34,20 +36,32 @@ def initialize_environment():
     for k, v in telemetry_vars.items():
         os.environ[k] = v
 
-def export_csv(summaries):
-    df = pd.DataFrame({"Summary": summaries})
-    return df.to_csv(index=False).encode()
+def export_chat_history(history, format_type="txt"):
+    """Export chat history to text or PDF"""
+    if format_type == "txt":
+        return "\n\n".join([f"Q: {item['question']}\nA: {item['answer']}" for item in history]).encode()
+    elif format_type == "pdf":
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        for item in history:
+            pdf.multi_cell(0, 10, f"Q: {item['question']}\nA: {item['answer']}\n\n")
+        pdf_output = pdf.output(dest='S').encode('latin1')
+        return pdf_output
 
-def export_pdf(summaries):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    for i, text in enumerate(summaries):
-        pdf.multi_cell(0, 10, f"Document {i+1} Summary:\n{text}\n\n")
-    pdf_output = pdf.output(dest='S').encode('latin1')
-    buffer = io.BytesIO(pdf_output)
-    return buffer.getvalue()
+def text_to_speech(text):
+    """Convert text to speech and play it"""
+    tts = gTTS(text=text, lang='en')
+    audio_file = io.BytesIO()
+    tts.write_to_fp(audio_file)
+    audio_file.seek(0)
+    
+    pygame.mixer.init()
+    pygame.mixer.music.load(audio_file)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        continue
 
 def display_sidebar():
     """Sidebar with model selection and system controls"""
@@ -73,22 +87,19 @@ def process_files(uploaded_files):
 
         progress = st.progress(0, text="Loading and processing documents...")
         documents = process_uploaded_files(file_paths)
-        progress.progress(40, text="Creating vector database...")
+        progress.progress(50, text="Creating vector database...")
 
         if not documents:
             st.error("No valid documents could be processed")
-            return None, None
+            return None
 
         vector_db = VectorDB(documents, model_name=st.session_state.model_name)
-        progress.progress(80, text="Generating summaries...")
-        summaries = summarize_content(documents)
         progress.progress(100, text="Done!")
-
-        return vector_db, summaries
+        return vector_db
 
     except Exception as e:
         st.error(f"Error processing files: {str(e)}")
-        return None, None
+        return None
 
     finally:
         try:
@@ -107,13 +118,15 @@ def main():
     st.title("Local RAG AI Agent")
     st.write("Upload documents and ask questions about their content")
 
+    # Initialize session state variables
     if 'vector_db' not in st.session_state:
         st.session_state.vector_db = None
     if 'processed' not in st.session_state:
         st.session_state.processed = False
-    if 'summaries' not in st.session_state:
-        st.session_state.summaries = []
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
 
+    # File upload section
     with st.expander("Upload Documents", expanded=True):
         uploaded_files = st.file_uploader(
             "Choose files (CSV, TXT, PDF)",
@@ -123,57 +136,70 @@ def main():
 
         if uploaded_files and st.button("Process Files"):
             with st.spinner("Processing files..."):
-                vector_db, summaries = process_files(uploaded_files)
-
-                if vector_db and summaries:
+                vector_db = process_files(uploaded_files)
+                if vector_db:
                     st.session_state.vector_db = vector_db
-                    st.session_state.summaries = summaries
                     st.session_state.processed = True
                     st.success("Files processed successfully!")
 
-    if st.session_state.processed and st.session_state.summaries:
-        with st.expander("Document Summaries"):
-            for i, summary in enumerate(st.session_state.summaries):
-                st.subheader(f"Document {i+1} Summary")
-                st.write(summary)
-
-            csv_data = export_csv(st.session_state.summaries)
-            st.download_button("Download CSV", csv_data, file_name="summaries.csv", mime="text/csv")
-
-            pdf_data = export_pdf(st.session_state.summaries)
-            st.download_button("Download PDF", pdf_data, file_name="summaries.pdf", mime="application/pdf")
-
-        st.divider()
-        st.subheader("Ask a question based on summaries")
-        question_summary = st.text_input("Query summaries only:")
-        if question_summary and st.button("Get Answer from Summary"):
-            with st.spinner("Querying summaries..."):
-                from langchain_core.documents import Document
-                summary_docs = [Document(page_content=s) for s in st.session_state.summaries]
-                summary_vector_db = VectorDB(summary_docs, model_name=st.session_state.model_name)
-                qa_chain = QAChain(summary_vector_db)
-                answer = qa_chain.ask_question(question_summary)
-                st.write(answer)
-
+    # Chat interface
     if st.session_state.processed:
         st.divider()
-        st.subheader("Ask a question based on full documents")
-        question = st.text_input("Ask a question:")
-        if question and st.button("Get Answer"):
-            with st.spinner("Searching for answer..."):
-                try:
-                    qa_chain = QAChain(st.session_state.vector_db)
-                    answer = qa_chain.ask_question(question)
-                    st.subheader("Answer")
-                    st.write(answer)
+        st.subheader("Ask a question")
+        question = st.text_input("Enter your question:")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if question and st.button("Get Answer"):
+                with st.spinner("Searching for answer..."):
+                    try:
+                        qa_chain = QAChain(st.session_state.vector_db)
+                        answer = qa_chain.ask_question(question)
+                        
+                        # Add to chat history
+                        st.session_state.chat_history.append({
+                            "question": question,
+                            "answer": answer
+                        })
+                        
+                        st.subheader("Answer")
+                        st.write(answer)
 
-                    with st.expander("Relevant Sources"):
-                        for doc in qa_chain.last_retrieved_docs:
-                            st.write(doc.page_content)
-                            st.caption(f"Source: {doc.metadata.get('source', 'Unknown')}")
-                            st.divider()
-                except Exception as e:
-                    st.error(f"Error generating answer: {str(e)}")
+                        with st.expander("Relevant Sources"):
+                            for doc in qa_chain.last_retrieved_docs:
+                                st.write(doc.page_content)
+                                st.caption(f"Source: {doc.metadata.get('source', 'Unknown')}")
+                                st.divider()
+                    except Exception as e:
+                        st.error(f"Error generating answer: {str(e)}")
+        
+        with col2:
+            if st.session_state.chat_history and st.button("Read Last Answer Aloud"):
+                text_to_speech(st.session_state.chat_history[-1]["answer"])
+
+        # Chat history display
+        if st.session_state.chat_history:
+            st.divider()
+            st.subheader("Chat History")
+            for i, chat in enumerate(st.session_state.chat_history):
+                st.markdown(f"**Q{i+1}:** {chat['question']}")
+                st.markdown(f"**A{i+1}:** {chat['answer']}")
+                st.divider()
+
+            # Export buttons
+            st.download_button(
+                "Download Chat History (TXT)",
+                export_chat_history(st.session_state.chat_history, "txt"),
+                file_name="chat_history.txt",
+                mime="text/plain"
+            )
+            
+            st.download_button(
+                "Download Chat History (PDF)",
+                export_chat_history(st.session_state.chat_history, "pdf"),
+                file_name="chat_history.pdf",
+                mime="application/pdf"
+            )
 
 if __name__ == "__main__":
     main()

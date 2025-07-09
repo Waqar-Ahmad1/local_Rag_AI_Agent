@@ -18,12 +18,10 @@ logger = logging.getLogger(__name__)
 try:
     from langchain_community.document_loaders import CSVLoader, TextLoader, PyPDFLoader
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain.chains.summarize import load_summarize_chain
-    from langchain_ollama import OllamaLLM
     from langchain_core.documents import Document
 except ImportError as e:
     logger.error(f"Missing dependencies: {e}")
-    logger.error("Required packages: langchain-community pypdf langchain-text-splitters langchain-ollama")
+    logger.error("Required packages: langchain-community pypdf langchain-text-splitters")
     raise
 
 def process_csv_file(file_path: str) -> Optional[List[Document]]:
@@ -147,56 +145,3 @@ def process_uploaded_files(file_paths: List[str]) -> List[Document]:
     
     logger.warning("No valid documents were processed")
     return []
-
-def summarize_content(documents: List[Document]) -> List[str]:
-    """Generate summaries for documents in batches with robust error handling"""
-    if not documents:
-        logger.warning("No documents provided for summarization")
-        return []
-
-    try:
-        llm = OllamaLLM(
-            model="llama3.2",
-            base_url="http://localhost:11434",
-            temperature=0.3
-        )
-        
-        summary_chain = load_summarize_chain(
-            llm,
-            chain_type="map_reduce",
-            verbose=False
-        )
-        
-        summaries = []
-        batch_size = 3
-        total_docs = len(documents)
-
-        for i in range(0, total_docs, batch_size):
-            batch = documents[i:i+batch_size]
-            try:
-                debug_document_batches(batch, i)  # <-- debug log
-                result = summary_chain.run(batch)
-                
-                if not result or not result.strip():
-                    logger.warning(f"Empty summary for batch {i+1}-{i+batch_size}")
-                    summaries.extend(["Summary unavailable"] * len(batch))
-                else:
-                    logger.info(f"Summarized documents {i+1}-{min(i+batch_size, total_docs)}/{total_docs}")
-                    summaries.extend([result] * len(batch))
-                    
-            except Exception as batch_error:
-                logger.error(f"Error summarizing batch {i//batch_size + 1}: {batch_error}")
-                summaries.extend(["Summary unavailable"] * len(batch))
-        
-        return summaries
-
-    except Exception as e:
-        logger.error(f"Summarization setup failed: {e}")
-        return ["Summary generation failed"] * len(documents)
-
-def debug_document_batches(batch: List[Document], batch_index: int):
-    """Prints first few characters of documents in the current batch for debugging."""
-    logger.debug(f"--- Batch {batch_index//3 + 1} Preview ---")
-    for j, doc in enumerate(batch):
-        preview = doc.page_content.strip()[:200].replace('\n', ' ')
-        logger.debug(f"Doc {j+1} Preview: {preview}")
